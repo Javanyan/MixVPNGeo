@@ -1,0 +1,128 @@
+name: Update Routing Configs
+
+on:
+  workflow_dispatch:
+  schedule:
+    # каждые 6 часов — проверка новых версий geo и регенерация диплинков
+    - cron: "0 */6 * * *"
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
+      - "LICENSE"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate HAPP/INCY configs and deeplinks
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TZ=UTC
+
+          # Источник geo-данных (общие открытые списки RU/BY routing)
+          GEOIP_REPO="Javanyan/MixVPN-geoip"
+          GEOSITE_REPO="Javanyan/MixVPN-geosite"
+
+          latest_tag() {
+            git ls-remote --tags "https://github.com/${1}.git" \
+              | awk '{print $2}' \
+              | sed -E 's@refs/tags/@@; s@\^\{\}@@' \
+              | grep -E '^[0-9]{12}$' \
+              | sort -r | head -n 1
+          }
+
+          geoip_tag="$(latest_tag "$GEOIP_REPO")"
+          geosite_tag="$(latest_tag "$GEOSITE_REPO")"
+          [[ -n "$geoip_tag" && -n "$geosite_tag" ]]
+
+          geoip_url="https://cdn.jsdelivr.net/gh/${GEOIP_REPO}@${geoip_tag}/release/geoip.dat"
+          geosite_url="https://cdn.jsdelivr.net/gh/${GEOSITE_REPO}@${geosite_tag}/release/geosite.dat"
+
+          # доступность
+          curl -fsSL --retry 3 --retry-delay 2 -I "$geoip_url" >/dev/null
+          curl -fsSL --retry 3 --retry-delay 2 -I "$geosite_url" >/dev/null
+
+          now_epoch="$(date -u +%s)"
+
+          bump() {
+            local f="$1"
+            local tmp; tmp="$(mktemp)"
+            jq --arg ts "$now_epoch" --arg gi "$geoip_url" --arg gs "$geosite_url" \
+              '.LastUpdated=$ts | .Geoipurl=$gi | .Geositeurl=$gs' "$f" > "$tmp"
+            mv "$tmp" "$f"
+          }
+
+          for f in HAPP/DEFAULT.JSON HAPP/WHITELIST.JSON HAPP/JSONSUB.JSON \
+                   INCY/DEFAULT.JSON INCY/WHITELIST.JSON INCY/JSONSUB.JSON; do
+            bump "$f"
+          done
+
+          # регенерация base64-диплинков (onadd = авто-применение при добавлении подписки)
+          gen() {
+            local f="$1" scheme="$2" out="$3"
+            local b64; b64="$(jq -c . "$f" | base64 -w 0)"
+            printf '%s://routing/onadd/%s\n' "$scheme" "$b64" > "$out"
+          }
+          gen HAPP/DEFAULT.JSON   happ HAPP/DEFAULT.DEEPLINK
+          gen HAPP/WHITELIST.JSON happ HAPP/WHITELIST.DEEPLINK
+          gen HAPP/JSONSUB.JSON   happ HAPP/JSONSUB.DEEPLINK
+          gen INCY/DEFAULT.JSON   incy INCY/DEFAULT.DEEPLINK
+          gen INCY/WHITELIST.JSON incy INCY/WHITELIST.DEEPLINK
+          gen INCY/JSONSUB.JSON   incy INCY/JSONSUB.DEEPLINK
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add HAPP INCY
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git commit -m "auto-update $(date -u +%Y%m%d%H%M)"
+          git push
+
+  # ── Опциональный деплой geo.dat на ноды (по умолчанию ВЫКЛЮЧЕН) ──
+  # Чтобы включить: задай secrets DEPLOY_SSH_KEY и DEPLOY_SERVERS,
+  # затем поменяй "if: false" ниже на "if: ${{ secrets.DEPLOY_SERVERS != '' }}".
+  # ВНИМАНИЕ: этот job делает docker compose down/up на нодах — это разрывает
+  # активные соединения пользователей. Включай осознанно.
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: Deploy geo files to nodes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/deploy_key"
+          IFS=',' read -ra SERVERS <<< "${{ secrets.DEPLOY_SERVERS }}"
+          for SERVER in "${SERVERS[@]}"; do
+            SERVER="$(echo "$SERVER" | xargs)"
+            [ -z "$SERVER" ] && continue
+            ssh $SSH_OPTS "$SERVER" bash -s <<'REMOTE'
+              set -euo pipefail
+              if [ -d /opt/remnanode ]; then T=/opt/remnanode
+              elif [ -d /opt/remnawave/node ]; then T=/opt/remnawave/node
+              else exit 0; fi
+              curl -fsSL -o "$T/geoip.dat"   "https://github.com/Javanyan/MixVPN-geoip/releases/latest/download/geoip.dat"
+              curl -fsSL -o "$T/geosite.dat" "https://github.com/Javanyan/MixVPN-geosite/releases/latest/download/geosite.dat"
+              cd "$T" && docker compose down && docker compose up -d
+REMOTE
+          done
+          rm -f ~/.ssh/deploy_key
